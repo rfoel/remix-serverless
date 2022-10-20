@@ -1,0 +1,130 @@
+service: remix-serverless
+
+frameworkVersion: '3'
+
+plugins:
+  - serverless-esbuild
+  - serverless-s3-sync
+
+provider:
+  name: aws
+  runtime: nodejs16.x
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'us-east-1'}
+
+custom:
+  esbuild:
+    bundle: true
+    minify: false
+    sourcemap: true
+    sourcesContent: false
+    exclude: ['aws-sdk']
+    target: 'node16'
+    platform: 'node'
+
+  s3Sync:
+    buckets:
+      - bucketNameKey: WebsiteBucketName
+        bucketPrefix: website/
+        localDir: public
+
+functions:
+  remix:
+    handler: server/remix.handler
+    events:
+      - httpApi:
+          method: any
+          path: '/{proxy+}'
+
+resources:
+  Resources:
+    HttpApi:
+      Type: AWS::ApiGatewayV2::Api
+      Properties:
+        Name: HttpApi-${self:service}
+        ProtocolType: HTTP
+
+    WebsiteBucket:
+      Type: AWS::S3::Bucket
+      Properties: {}
+
+    WebsiteOriginAccessIdentity:
+      Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+      Properties:
+        CloudFrontOriginAccessIdentityConfig:
+          Comment: Origin Access Identity to Access ${self:service} Website Bucket
+
+    WebsiteBucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        Bucket: !Ref WebsiteBucket
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource:
+                Fn::Join:
+                  - /
+                  - - Fn::GetAtt:
+                        - WebsiteBucket
+                        - Arn
+                    - '*'
+              Principal:
+                CanonicalUser:
+                  Fn::GetAtt:
+                    - WebsiteOriginAccessIdentity
+                    - S3CanonicalUserId
+
+    CDN:
+      Type: AWS::CloudFront::Distribution
+      DependsOn:
+        - WebsiteBucket
+        - HttpApi
+      Properties:
+        DistributionConfig:
+          Enabled: true
+          Origins:
+            - DomainName:
+                Fn::GetAtt:
+                  - WebsiteBucket
+                  - RegionalDomainName
+              Id: StaticOrigin
+              S3OriginConfig:
+                OriginAccessIdentity:
+                  Fn::Join:
+                    - /
+                    - - origin-access-identity
+                      - cloudfront
+                      - !Ref WebsiteOriginAccessIdentity
+              OriginPath: '/website'
+            - DomainName:
+                Fn::Join:
+                  - ''
+                  - - Ref: HttpApi
+                    - '.execute-api.${self:provider.region}.amazonaws.com'
+              Id: RemixOrigin
+              CustomOriginConfig:
+                OriginProtocolPolicy: https-only
+                OriginSSLProtocols: [TLSv1.2]
+          DefaultCacheBehavior:
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD, OPTIONS]
+            Compress: true
+            TargetOriginId: RemixOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            ForwardedValues:
+              QueryString: true
+              Cookies:
+                Forward: none
+
+  Outputs:
+    WebsiteBucketName:
+      Value:
+        Ref: WebsiteBucket
+    DistributionID:
+      Value:
+        Ref: CDN
+    WebsiteDomain:
+      Value:
+        Fn::GetAtt: [CDN, DomainName]
